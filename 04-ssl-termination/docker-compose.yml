@@ -1,0 +1,16 @@
+services:
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8080:8080"
+      - "8443:8443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - backend
+
+  backend:
+    build: ../shared/backend
+    environment:
+      - INSTANCE_ID=ssl-backend
