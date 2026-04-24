@@ -4,7 +4,7 @@
 
 A reverse proxy sits between clients and backend servers. Clients talk to nginx, and nginx forwards requests to the backend. The backend is never exposed directly.
 
-**Key directives:** `proxy_pass`, `proxy_set_header`
+**Key directives:** `proxy_pass`, `proxy_set_header`, `return 403`
 
 ## Start
 
@@ -43,15 +43,32 @@ The backend container has no published ports. It's only reachable through nginx.
 docker compose logs nginx
 ```
 
+**Confirm /health is blocked by nginx:**
+
+```bash
+curl -s http://localhost:8080/health
+```
+
+You should see:
+
+```json
+{"error": "forbidden", "message": "This endpoint is internal only"}
+```
+
+The backend has a `/health` endpoint, but nginx returns 403 before the request ever reaches it. This is a common production pattern — internal endpoints like `/health`, `/metrics`, or `/debug` exist for monitoring tools running on the same network, but should never be reachable from the public internet.
+
+**Why this matters:** The backend still has `/health` — it's just that nginx decides who gets to see it. On a real VM, you'd allow access from internal IPs (load balancer health checks, Prometheus scrapers) while blocking everyone else.
+
 ## Aha Moment
 
-The backend is completely hidden behind nginx. Try `docker compose ps` — you'll see the backend has no port mappings. The only way in is through port 8080 via nginx.
+The backend is completely hidden behind nginx. Try `docker compose ps` — you'll see the backend has no port mappings. The only way in is through port 8080 via nginx. And even through nginx, not everything is accessible — `/health` is blocked.
 
 ## Tweak Exercises
 
 1. Add a new `proxy_set_header` for a custom header (e.g., `X-Workshop: nginx-demo`) and check if the backend receives it
 2. Change `proxy_pass` to point to a non-existent service and observe the error
-3. Add a second `location /health` block that proxies to `/health` on the backend
+3. Change the `/health` location from `return 403` to `proxy_pass http://backend:5000;` — now `/health` is public again
+4. Allow `/health` only from localhost by using `allow 127.0.0.1; deny all;` instead of `return 403`
 
 After any `nginx.conf` change:
 

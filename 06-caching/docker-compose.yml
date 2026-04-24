@@ -6,8 +6,15 @@ services:
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
 
   backend:
     build: .
     # Uses the local app.py (slow backend), not the shared one
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 3
+      start_period: 5s

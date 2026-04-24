@@ -139,3 +139,142 @@ large_client_header_buffers 4 16k;
 ```
 
 If your application legitimately needs huge cookies (e.g., storing session data in cookies), the real fix is to move that data server-side (into a session store like Redis) and use a small session ID cookie instead.
+
+---
+
+## 2. `unexpected end of file, expecting ";"` after editing nginx.conf
+
+### What you see
+
+```
+[emerg] unexpected end of file, expecting ";" or "}" in /etc/nginx/conf.d/default.conf:17
+```
+
+You edited `nginx.conf` on your host, ran `nginx -s reload`, and nginx refuses the config. But when you open the file it looks perfectly fine — no syntax errors, all braces matched.
+
+### Reproduce it
+
+**Step 1 — Start any scenario:**
+
+```bash
+cd 01-static-files
+docker compose up -d
+```
+
+**Step 2 — Add a few lines to `nginx.conf`** (making the file larger than before), then reload:
+
+```bash
+docker compose exec nginx nginx -s reload
+```
+
+**Step 3 — Check what nginx actually sees:**
+
+```bash
+docker compose exec nginx cat /etc/nginx/conf.d/default.conf
+```
+
+You'll notice the file is **truncated** — the last few lines are cut off. The file inside the container is shorter than the one on your host.
+
+### Why it happens
+
+This is a **Docker bind mount caching issue on macOS**. Docker Desktop for Mac uses a file-sharing layer (gRPC FUSE or VirtioFS) between your host filesystem and the Linux VM running containers. When a file grows in size, the container sometimes sees the old (shorter) file content until the mount is refreshed.
+
+The sequence:
+1. Container starts, mounts `nginx.conf` (say, 400 bytes)
+2. You edit the file, adding lines (now 600 bytes)
+3. `nginx -s reload` reads the file, but Docker still reports it as 400 bytes
+4. Nginx reads 400 bytes, hits EOF mid-config → syntax error
+
+This does NOT happen on Linux (native bind mounts) — only on macOS and Windows where Docker uses a VM.
+
+### The fix
+
+**`nginx -s reload` is not enough when the file size changed.** Restart the container instead:
+
+```bash
+docker compose down && docker compose up -d
+```
+
+This forces Docker to re-read the file from scratch.
+
+**Tip:** `nginx -s reload` works fine when you edit the file without changing its length (e.g., changing a number or commenting/uncommenting lines of equal length). But any time you add or remove lines, restart the container to be safe.
+
+### Why `nginx -s reload` works on a real VM but not here
+
+On a production VM, nginx reads the config file directly from the local filesystem — there's no virtualization layer in between. `nginx -s reload` always sees the latest file. The truncation problem is purely a Docker-on-macOS artifact.
+
+---
+
+## 3. `host not found in upstream` — nginx crashes if backends aren't ready
+
+### What you see
+
+```
+[emerg] host not found in upstream "backend-1:5000" in /etc/nginx/conf.d/default.conf:7
+nginx: [emerg] host not found in upstream "backend-1:5000" in /etc/nginx/conf.d/default.conf:7
+```
+
+Nginx exits with code 1 and refuses to start.
+
+### Why it happens
+
+Nginx resolves **every hostname in `upstream` blocks at startup time**. If it can't resolve even one, it crashes immediately. It doesn't retry, it doesn't wait, it doesn't start with the backends it *can* find — it just dies.
+
+In Docker Compose, `depends_on` only ensures the backend container is *created and started*. But "started" doesn't mean "healthy and DNS-resolvable" — there's a race condition where nginx starts before Docker's internal DNS has registered the backend hostname.
+
+### Isn't it strange for nginx to depend on its backends?
+
+Yes. A reverse proxy should ideally start independently and handle backends coming and going. This is one of nginx's most criticized design decisions:
+
+- **At startup:** nginx resolves all `upstream` hostnames and bakes the IP addresses into memory. If DNS fails, nginx crashes.
+- **At runtime:** once started, if a backend goes down, nginx handles it gracefully (marks it as unavailable, routes around it). But it will never re-resolve the DNS.
+- **On reload:** `nginx -s reload` re-resolves everything. If a backend is gone at reload time, nginx keeps the old config.
+
+This means nginx treats DNS as a startup dependency, not a runtime service. Most other reverse proxies (HAProxy, Envoy, Traefik, Caddy) handle this more gracefully.
+
+### The fix (what our workshop uses)
+
+We use Docker Compose health checks so backends are confirmed healthy before nginx starts:
+
+```yaml
+services:
+  nginx:
+    image: nginx:alpine
+    depends_on:
+      backend:
+        condition: service_healthy    # Wait for healthy, not just started
+
+  backend:
+    build: ../shared/backend
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 3
+      start_period: 5s
+```
+
+Docker waits until the health check passes before starting nginx, guaranteeing the hostname is resolvable.
+
+### Production alternatives
+
+On a real VM (no Docker Compose orchestrating startup order), you'd use one of these:
+
+**Option A: `resolver` directive with a variable** — forces nginx to resolve DNS at request time, not startup:
+
+```nginx
+server {
+    resolver 127.0.0.11 valid=10s;  # Docker's internal DNS
+
+    location / {
+        set $backend http://backend:5000;   # Variable forces runtime resolution
+        proxy_pass $backend;
+    }
+}
+```
+
+This is the standard workaround. The `set` variable trick is necessary because `proxy_pass` with a literal hostname resolves at config load time, but with a variable it resolves per-request.
+
+**Option B: nginx-plus** (commercial) — has native DNS re-resolution in `upstream` blocks.
+
+**Option C: Use a different reverse proxy** — Traefik, Caddy, and Envoy all resolve DNS dynamically out of the box.

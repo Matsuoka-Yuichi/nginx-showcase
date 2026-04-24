@@ -27,6 +27,11 @@ def slow():
     )
 
 
+@app.route("/health")
+def health():
+    return jsonify(status="ok")
+
+
 @app.route("/fast")
 def fast():
     return jsonify(
